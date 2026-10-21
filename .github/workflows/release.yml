@@ -1,0 +1,267 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BASE_IMAGE: wodby/drupal-php@sha256:a97a10f209006fdd5ead19b4ccb47ae6a53044ba48942c1597b505eb84d5c55a
+  PHP_BASE_COMMIT: 004cb827501d1ddaf98daacb185a53e0816f78a7
+  PHP_SECURITY_COMMIT: 712e60f9edfd03f0960fc4fc3c2c375f42b90aa2
+  PATCH_SHA256: de1b914a84b25196b82ede7d8c0031d43be72f232b259b984e7ef72507b10631
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/drupal-php-backport
+
+jobs:
+  provenance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exact official patch
+        run: sh scripts/verify-provenance.sh
+
+  build:
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        name: Build and push native architecture image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:build-${{ github.run_id }}-${{ matrix.suffix }}
+          # Per-architecture attestations turn the output digest into an OCI
+          # index containing the image plus unknown/unknown attestations. Using
+          # those nested indexes as manifest sources hides the real platforms.
+          provenance: false
+          sbom: false
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            PHP_BASE_COMMIT=${{ env.PHP_BASE_COMMIT }}
+            PHP_SECURITY_COMMIT=${{ env.PHP_SECURITY_COMMIT }}
+            PATCH_SHA256=${{ env.PATCH_SHA256 }}
+      - name: Pull immutable architecture image
+        run: docker pull "${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+      - name: Test exact architecture image
+        env:
+          FIXED_IMAGE: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: sh scripts/test-image.sh
+      - name: Record architecture digest
+        shell: bash
+        run: |
+          mkdir -p digest
+          printf '%s\n' '${{ steps.build.outputs.digest }}' > "digest/${{ matrix.suffix }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.suffix }}
+          path: digest/${{ matrix.suffix }}
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.inspect.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tags
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            release="${GITHUB_REF#refs/tags/}"
+            if [[ ! "$release" =~ ^v7\.4\.34-cve-2026-109618-109619\.[1-9][0-9]*$ ]]; then
+              echo "::error title=Invalid release tag::Expected v7.4.34-cve-2026-109618-109619.N"
+              exit 1
+            fi
+          else
+            release="manual-${GITHUB_RUN_ID}"
+          fi
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+      - name: Create final multi-architecture manifest
+        shell: bash
+        run: |
+          amd64_digest="$(cat digests/amd64)"
+          arm64_digest="$(cat digests/arm64)"
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${{ steps.tags.outputs.release }}" \
+            --tag "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            "${IMAGE_NAME}@${amd64_digest}" \
+            "${IMAGE_NAME}@${arm64_digest}"
+      - id: inspect
+        name: Verify platforms and resolve final manifest digest
+        shell: bash
+        run: |
+          image="${IMAGE_NAME}:${{ steps.tags.outputs.release }}"
+          raw="$(docker buildx imagetools inspect "$image" --raw)"
+          platforms="$(
+            printf '%s' "$raw" |
+              jq -r '.manifests[] | select(.platform.os != "unknown") |
+                "\(.platform.os)/\(.platform.architecture)"' |
+              sort -u
+          )"
+          expected="$(printf '%s\n' linux/amd64 linux/arm64)"
+          if [[ "$platforms" != "$expected" ]]; then
+            echo "::error title=Invalid published platforms::Expected linux/amd64 and linux/arm64, got: ${platforms//$'\n'/, }"
+            exit 1
+          fi
+          digest="$(
+            docker buildx imagetools inspect \
+              "$image" \
+              --format '{{json .Manifest.Digest}}' | tr -d '"'
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'release=%s\n' '${{ steps.tags.outputs.release }}' >> "$GITHUB_OUTPUT"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "${IMAGE_NAME}@${digest}"
+          {
+            echo "## Published image"
+            echo
+            echo '```text'
+            echo "${IMAGE_NAME}:${{ steps.tags.outputs.release }}"
+            echo "${IMAGE_NAME}@${digest}"
+            echo '```'
+            echo
+            echo "Platforms: linux/amd64, linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify-published:
+    needs: merge
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull immutable published image
+        run: docker pull --platform "${{ matrix.platform }}" "${IMAGE_NAME}@${{ needs.merge.outputs.digest }}"
+      - name: Test published runtime and image parity
+        env:
+          FIXED_IMAGE: ${{ env.IMAGE_NAME }}@${{ needs.merge.outputs.digest }}
+        run: sh scripts/test-image.sh
+
+  finalize:
+    needs:
+      - merge
+      - verify-published
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Sign immutable image digest
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+      - name: Generate SPDX SBOM for immutable image
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ needs.merge.outputs.digest }}
+          format: spdx-json
+          output-file: release-sbom.spdx.json
+          upload-artifact: false
+      - name: Attest SBOM to immutable image
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.merge.outputs.digest }}
+          sbom-path: release-sbom.spdx.json
+          push-to-registry: true
+      - name: Generate release evidence
+        env:
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            release="${GITHUB_REF#refs/tags/}"
+          else
+            release="manual-${GITHUB_RUN_ID}"
+          fi
+          {
+            echo "Release tag: ${release}"
+            echo "Image tag: ${IMAGE_NAME}:${release}"
+            echo "Immutable image: ${IMAGE_NAME}@${DIGEST}"
+            echo "Pull by tag: docker pull ${IMAGE_NAME}:${release}"
+            echo "Pull by digest: docker pull ${IMAGE_NAME}@${DIGEST}"
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo "Base: ${BASE_IMAGE}"
+            echo "PHP baseline: ${PHP_BASE_COMMIT}"
+            echo "PHP mitigation: ${PHP_SECURITY_COMMIT}"
+            echo "Patch SHA-256: ${PATCH_SHA256}"
+          } | tee release-evidence.txt
+          {
+            echo "## Release evidence"
+            echo
+            echo '```text'
+            cat release-evidence.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.merge.outputs.digest }}
+          push-to-registry: true
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            release-evidence.txt
+            release-sbom.spdx.json
+          generate_release_notes: true
